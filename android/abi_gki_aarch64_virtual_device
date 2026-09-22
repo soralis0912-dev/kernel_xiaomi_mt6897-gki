@@ -1157,6 +1157,7 @@
   __traceiter_dma_fence_emit
   __tracepoint_dma_fence_emit
   vmemdup_user
+  ww_mutex_lock
   ww_mutex_lock_interruptible
   ww_mutex_unlock
 
@@ -1273,6 +1274,7 @@
   bpf_prog_add
   bpf_prog_put
   bpf_prog_sub
+  bpf_redirect_info
   bpf_stats_enabled_key
   bpf_warn_invalid_xdp_action
   __cpuhp_remove_state

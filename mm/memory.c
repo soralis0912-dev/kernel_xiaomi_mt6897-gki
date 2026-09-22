@@ -169,6 +169,8 @@ static int __init init_zero_pfn(void)
 }
 early_initcall(init_zero_pfn);
 
+EXPORT_TRACEPOINT_SYMBOL_GPL(rss_stat);
+
 void mm_trace_rss_stat(struct mm_struct *mm, int member, long count)
 {
 	trace_rss_stat(mm, member, count);
@@ -1353,6 +1355,7 @@ copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma)
 			continue;
 		if (unlikely(copy_p4d_range(dst_vma, src_vma, dst_pgd, src_pgd,
 					    addr, next))) {
+			untrack_pfn_clear(dst_vma);
 			ret = -ENOMEM;
 			break;
 		}
@@ -1491,7 +1494,7 @@ again:
 			 * consider uffd-wp bit when zap. For more information,
 			 * see zap_install_uffd_wp_if_needed().
 			 */
-			WARN_ON_ONCE(!vma_is_anonymous(vma));
+			WARN_ON_ONCE(!PageAnon(page));
 			rss[mm_counter(page)]--;
 			if (is_device_private_entry(entry))
 				page_remove_rmap(page, vma, false);
@@ -2684,11 +2687,11 @@ static int apply_to_pte_range(struct mm_struct *mm, pmd_t *pmd,
 	if (fn) {
 		do {
 			if (create || !pte_none(*pte)) {
-				err = fn(pte++, addr, data);
+				err = fn(pte, addr, data);
 				if (err)
 					break;
 			}
-		} while (addr += PAGE_SIZE, addr != end);
+		} while (pte++, addr += PAGE_SIZE, addr != end);
 	}
 	*mask |= PGTBL_PTE_MODIFIED;
 
@@ -3838,6 +3841,8 @@ static vm_fault_t handle_pte_marker(struct vm_fault *vmf)
 	return VM_FAULT_SIGBUS;
 }
 
+static DECLARE_WAIT_QUEUE_HEAD(swapcache_wq);
+
 /*
  * We enter with non-exclusive mmap_lock (to exclude vma changes,
  * but allow concurrent faults), and pte mapped but not yet locked.
@@ -3850,6 +3855,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct folio *swapcache, *folio = NULL;
+	DECLARE_WAITQUEUE(wait, current);
 	struct page *page;
 	struct swap_info_struct *si = NULL;
 	rmap_t rmap_flags = RMAP_NONE;
@@ -3933,7 +3939,9 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 			 */
 			if (swapcache_prepare(entry)) {
 				/* Relax a bit to prevent rapid repeated page faults */
+				add_wait_queue(&swapcache_wq, &wait);
 				schedule_timeout_uninterruptible(1);
+				remove_wait_queue(&swapcache_wq, &wait);
 				goto out;
 			}
 			need_clear_cache = true;
@@ -4189,8 +4197,11 @@ unlock:
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 out:
 	/* Clear the swap cache pin for direct swapin after PTL unlock */
-	if (need_clear_cache)
+	if (need_clear_cache) {
 		swapcache_clear(si, entry);
+		if (waitqueue_active(&swapcache_wq))
+			wake_up(&swapcache_wq);
+	}
 	if (si)
 		put_swap_device(si);
 	return ret;
@@ -4204,8 +4215,11 @@ out_release:
 		folio_unlock(swapcache);
 		folio_put(swapcache);
 	}
-	if (need_clear_cache)
+	if (need_clear_cache) {
 		swapcache_clear(si, entry);
+		if (waitqueue_active(&swapcache_wq))
+			wake_up(&swapcache_wq);
+	}
 	if (si)
 		put_swap_device(si);
 	return ret;
@@ -4652,9 +4666,18 @@ late_initcall(fault_around_debugfs);
 static vm_fault_t do_fault_around(struct vm_fault *vmf)
 {
 	unsigned long address = vmf->address, nr_pages, mask;
+	pgoff_t vma_off = vmf->pgoff - vmf->vma->vm_pgoff;
+	pgoff_t nr_data_pages = vma_data_pages(vmf->vma);
 	pgoff_t start_pgoff = vmf->pgoff;
 	pgoff_t end_pgoff;
 	int off;
+
+	/*
+	 * Fault occurred in the padding region. There are no file-cache pages
+	 * to map in this region, so skip fault-around.
+	 */
+	if (vma_off >= nr_data_pages)
+		return 0;
 
 	nr_pages = READ_ONCE(fault_around_bytes) >> PAGE_SHIFT;
 	mask = ~(nr_pages * PAGE_SIZE - 1) & PAGE_MASK;
@@ -4670,7 +4693,7 @@ static vm_fault_t do_fault_around(struct vm_fault *vmf)
 	end_pgoff = start_pgoff -
 		((address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1)) +
 		PTRS_PER_PTE - 1;
-	end_pgoff = min3(end_pgoff, vma_data_pages(vmf->vma) + vmf->vma->vm_pgoff - 1,
+	end_pgoff = min3(end_pgoff, nr_data_pages + vmf->vma->vm_pgoff - 1,
 			start_pgoff + nr_pages - 1);
 
 	if (pmd_none(*vmf->pmd)) {
